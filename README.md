@@ -64,8 +64,15 @@ datacheck generate-collect-script sheets/パラメータシート_Smaph2.xlsx -o
 
 - 収集対象パスを**重複除去した平文のリスト**としてスクリプト内に直接埋め込む
   （base64等のエンコードはしない。コピー&ペーストでの配置を前提としており、実行前に一覧を目視確認できる）
+- 上記に加えて、`/etc/httpd` `/etc/postfix` `/etc/dovecot` `/etc/vsftpd` 配下を**ディレクトリごと収集**する。
+  シートに記載の無いファイルも回収されるため、後段の突合で漏れを検出できる
+- **秘密鍵類は収集しない**。`*.key` `*.pem` `*.p12` `*.pfx` `*.jks` `*.keystore` および
+  `*/private/*` は除外し、manifestに `skipped_sensitive` として記録する
 - 依存は bash と coreutils + tar/gzip のみ。jq や python3 は不要
 - RHEL準拠（Windowsパスの考慮は含まない）
+
+manifestの `status` 列: `collected`（シート記載のパス）/ `collected_dir`（ディレクトリ収集）/
+`not_found` / `copy_failed` / `skipped_sensitive`
 
 サーバ側での実行:
 
@@ -139,6 +146,7 @@ datacheck compare-config items.yaml settingarchives/*.tar --format tsv -o report
 | `--format yaml\|table\|tsv` | 既定は `yaml`。`table`=整形表、`tsv`=Excel貼り付け用 |
 | `--only-problems` | `ok` / `skipped` 以外だけを出力 |
 | `--no-coverage` | 漏れチェックを行わない |
+| `--include-unloaded` | 漏れチェックで、読み込まれないファイルも対象にする |
 | `--reference DIR` | RHEL既定設定の参照先。既定は `reference/rhel-pkgs` |
 | `-o FILE` | 出力先（省略時は標準出力） |
 
@@ -205,6 +213,13 @@ datacheck compare-config items.yaml settingarchives/*.tar --format tsv -o report
 
 - 対象ファイルは `*.conf` `*.conf.ext` `main.cf` `master.cf` のみ
   （access/canonical等のルックアップテーブル、ftpusers、magic、証明書、スクリプトは除外）
+- **実際に読み込まれるファイルだけを対象にする。** `httpd.conf` の `Include`/`IncludeOptional`、
+  `dovecot.conf` の `!include`/`!include_try` を辿って到達したファイルのみを見る
+  （Apacheの相対パスは`ServerRoot`基準、Dovecotはincludeした側のファイルのディレクトリ基準）。
+  置いてあるだけで読み込まれないファイル（コメントアウトされた`!include`の`auth-ldap.conf.ext`等）の
+  設定は効いていないため、漏れとして報告しない。全ファイルを見たい場合は `--include-unloaded`
+- 起点(`httpd.conf`/`dovecot.conf`)がアーカイブに無いサービスは判定できないため、
+  そのディレクトリ配下の設定ファイルを全て対象とする（取りこぼし防止）
 - コメントアウト行は対象外（実際に効いている設定のみを漏れとして扱う）
 - シートが1行も言及していないファイルは、個々の設定を列挙せず `uncovered_file` 1行にまとめる
 

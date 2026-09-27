@@ -40,7 +40,7 @@ import sys
 import tarfile
 import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import yaml
 
@@ -256,11 +256,18 @@ def parse_dovecot(lines: list[str]) -> list[Entry]:
     return entries
 
 
+# master.cf の継続行に現れるオプション("-o name=value" など)。
+# "# ----------" のようなコメント罫線を継続行と誤認しないよう、1文字の英字フラグに限定する。
+_MASTER_CF_OPTION_RE = re.compile(r"^-[A-Za-z](?:[=\s]|$)")
+
+
 def parse_master_cf(lines: list[str]) -> list[Entry]:
     """postfix master.cf は列形式:
       service type private unpriv chroot wakeup maxproc command
-    行頭が空白の "-o key=value" 継続行は、パラメータシート側でもサービス行の値に
-    含めて記載されているため、独立した項目にせずサービス行のargsに畳み込む。"""
+    "-o key=value" 継続行は、パラメータシート側でもサービス行の値に含めて記載されているため、
+    独立した項目にせずサービス行のargsに畳み込む。
+    継続行は行頭が空白のものだけでなく "#  -o key=value" とコメントアウトされている場合もあり、
+    後者はサービス行(#smtp inet ...)と紛らわしいのでオプション形式かどうかで判別する。"""
     entries: list[Entry] = []
     current: Entry | None = None
     for idx, raw in enumerate(lines, start=1):
@@ -270,7 +277,7 @@ def parse_master_cf(lines: list[str]) -> list[Entry]:
         active, body = _split_comment(line)
         if not body:
             continue
-        if line[0] in " \t":
+        if line[0] in " \t" or (line.startswith("#") and _MASTER_CF_OPTION_RE.match(body)):
             if current is not None and current.active == active:
                 current.args = f"{current.args} {body}".strip()
                 current.raw = f"{current.raw} {line.strip()}"
@@ -310,6 +317,76 @@ def _parser_for(path: str):
 
 # 設定が格納されているディレクトリ（漏れチェックの走査対象）
 COVERAGE_DIRS = ("/etc/httpd", "/etc/postfix", "/etc/dovecot", "/etc/vsftpd")
+
+
+_APACHE_INCLUDE = {"include", "includeoptional"}
+_DOVECOT_INCLUDE = {"!include", "!include_try"}
+# includeを辿る起点と、そのサービスの設定ディレクトリ
+_INCLUDE_ROOTS = (
+    ("/etc/httpd/conf/httpd.conf", "/etc/httpd", "apache"),
+    ("/etc/dovecot/dovecot.conf", "/etc/dovecot", "dovecot"),
+)
+# includeの仕組みが無く、読み込まれるファイルが固定のもの
+_FIXED_LOADED = ("/etc/postfix/main.cf", "/etc/postfix/master.cf", "/etc/vsftpd/vsftpd.conf")
+
+
+def _expand_include(root: Path, base_dir: str, arg: str) -> list[str]:
+    """include先の指定(相対/絶対、ワイルドカード可)を、アーカイブ内に実在する絶対パスへ展開する。"""
+    target = _strip_quotes(_norm_ws(arg).split()[0]) if arg.strip() else ""
+    if not target:
+        return []
+    if not target.startswith("/"):
+        target = f"{base_dir.rstrip('/')}/{target}"
+    if any(ch in target for ch in "*?["):
+        return sorted("/" + str(p.relative_to(root)) for p in root.glob(target.lstrip("/")) if p.is_file())
+    return ["/" + str((root / target.lstrip("/")).relative_to(root))] if (root / target.lstrip("/")).is_file() else []
+
+
+def _walk_includes(root: Path, path: str, base_dir: str, fmt: str, loaded: set[str]) -> None:
+    if path in loaded:
+        return
+    fs_path = root / path.lstrip("/")
+    if not fs_path.is_file():
+        return
+    loaded.add(path)
+
+    parser, _ = _parser_for(path)
+    with fs_path.open(encoding="utf-8", errors="replace") as f:
+        entries = parser(f.readlines())
+
+    server_root = base_dir
+    for e in entries:
+        if not e.active:
+            continue
+        name = e.name.lower()
+        if fmt == "apache" and name == "serverroot":
+            server_root = _strip_quotes(_norm_ws(e.args)) or server_root
+            continue
+        if (fmt == "apache" and name in _APACHE_INCLUDE) or (fmt == "dovecot" and name in _DOVECOT_INCLUDE):
+            # Apacheの相対includeはServerRoot基準、Dovecotはincludeした側のファイルのディレクトリ基準
+            include_base = server_root if fmt == "apache" else str(PurePosixPath(path).parent)
+            for included in _expand_include(root, include_base, e.args):
+                _walk_includes(root, included, include_base, fmt, loaded)
+
+
+def resolve_loaded_files(root: Path) -> set[str]:
+    """アーカイブ内で実際にサービスに読み込まれる設定ファイルの絶対パス集合を返す。
+    起点(httpd.conf/dovecot.conf)が収集されていないサービスについては判定できないため、
+    そのディレクトリ配下の設定ファイルを全て対象とみなす(取りこぼしを防ぐ)。"""
+    loaded: set[str] = set()
+    for start, base_dir, fmt in _INCLUDE_ROOTS:
+        if (root / start.lstrip("/")).is_file():
+            _walk_includes(root, start, base_dir, fmt, loaded)
+        else:
+            loaded.update(
+                "/" + str(p.relative_to(root))
+                for p in (root / base_dir.lstrip("/")).rglob("*")
+                if p.is_file() and _is_config_file(str(p))
+            )
+    for path in _FIXED_LOADED:
+        if (root / path.lstrip("/")).is_file():
+            loaded.add(path)
+    return loaded
 
 
 def _is_config_file(path: str) -> bool:
@@ -777,11 +854,14 @@ def _row_targets(rows: list[dict]) -> dict[str, list[Target]]:
     return targets
 
 
-def check_coverage(rows: list[dict], archive: Archive, cache: _FileCache) -> list[dict]:
-    """アーカイブ内の設定ディレクトリを走査し、シートに記載が無い有効設定（漏れ）を洗い出す。"""
+def check_coverage(rows: list[dict], archive: Archive, cache: _FileCache, loaded_only: bool = True) -> list[dict]:
+    """アーカイブ内の設定ディレクトリを走査し、シートに記載が無い有効設定（漏れ）を洗い出す。
+    既定では include を解釈して実際に読み込まれるファイルだけを対象とする
+    （置いてあるだけで読み込まれないファイルの設定は効いていないため）。"""
     targets = _row_targets(rows)
     results: list[dict] = []
     root = archive.collected_root
+    loaded = resolve_loaded_files(root) if loaded_only else None
 
     for coverage_dir in COVERAGE_DIRS:
         base = root / coverage_dir.lstrip("/")
@@ -790,6 +870,8 @@ def check_coverage(rows: list[dict], archive: Archive, cache: _FileCache) -> lis
         for fs_path in sorted(p for p in base.rglob("*") if p.is_file()):
             abs_path = "/" + str(fs_path.relative_to(root))
             if not _is_config_file(abs_path):
+                continue
+            if loaded is not None and abs_path not in loaded:
                 continue
             entries = cache.entries(abs_path) or []
             active = [e for e in entries if e.active and e.kind == "directive"]
@@ -833,14 +915,14 @@ def check_coverage(rows: list[dict], archive: Archive, cache: _FileCache) -> lis
 
 
 def compare(rows: list[dict], archives: list[Archive], reference: _Reference | None = None,
-            coverage: bool = True) -> list[dict]:
+            coverage: bool = True, loaded_only: bool = True) -> list[dict]:
     results: list[dict] = []
     for archive in archives:
         cache = _FileCache(archive.collected_root)
         for row in rows:
             results.extend(compare_row(row, archive, cache, reference))
         if coverage:
-            results.extend(check_coverage(rows, archive, cache))
+            results.extend(check_coverage(rows, archive, cache, loaded_only))
     return results
 
 
@@ -1010,6 +1092,13 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
              "有効な設定のうちシートに記載が無いものを uncovered として報告する",
     )
     parser.add_argument(
+        "--include-unloaded",
+        dest="loaded_only",
+        action="store_false",
+        help="漏れチェックの対象を、includeを辿って実際に読み込まれるファイルに限定せず、"
+             "設定ディレクトリ配下の全設定ファイルにする",
+    )
+    parser.add_argument(
         "--format",
         choices=["yaml", "table", "tsv"],
         default="yaml",
@@ -1038,7 +1127,8 @@ def run(args: argparse.Namespace) -> int:
         print(f"注意: 参考パッケージディレクトリが見つからないため、RHELバージョン差の判定は行いません: {args.reference}", file=sys.stderr)
 
     try:
-        results = compare(rows, archives, reference, coverage=args.coverage)
+        results = compare(rows, archives, reference, coverage=args.coverage,
+                          loaded_only=args.loaded_only)
     finally:
         for a in archives:
             if a._tmp is not None:

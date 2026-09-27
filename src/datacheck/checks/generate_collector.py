@@ -6,6 +6,12 @@
   - 実行前に人間が一覧を目視で確認・修正できる
   - コピー＆ペースト時に文字化けやパディング崩れで壊れる心配がない（base64のような
     エンコード済みブロックと違い、1行1パスなので万一一部が欠けても被害は該当行に限られる）
+シートに記載されたパスに加えて、設定が格納されているディレクトリ（compare_config.COVERAGE_DIRS:
+/etc/httpd /etc/postfix /etc/dovecot /etc/vsftpd）配下を丸ごと収集する。これにより
+compare-config 側で「シートに記載の無いファイル」まで漏れとして検出できる。
+ただし秘密鍵類（*.key, *.pem, */private/*, キーストア）はサーバ外に持ち出さないよう除外し、
+manifest に skipped_sensitive として記録する。
+
 収集後は出力ディレクトリ全体（collected/ の階層構造・manifest.tsv・collect.log）を
 <output_dir>.tar.gz にアーカイブし、サーバから持ち帰る成果物を1ファイルにまとめる。
 実行環境にjqやpython3が無くても、bash + coreutils（cp, mkdir, dirname等）+ tar/gzip だけで動作する。
@@ -20,6 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import excel_config_path
+from .compare_config import COVERAGE_DIRS
 
 NAME = "generate-collect-script"
 DESCRIPTION = "抽出結果から、コピペでサーバに配置してファイル収集できる自己完結型シェルスクリプトを生成する"
@@ -46,21 +53,39 @@ total=0
 collected=0
 missing=0
 failed=0
+swept=0
+skipped=0
+
+# Private keys and keystores are never carried off the server.
+is_sensitive() {
+    case "$1" in
+        */private/*|*.key|*.pem|*.p12|*.pfx|*.jks|*.keystore) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+copy_file() {
+    local path="$1" status="$2" rel dest
+    rel="${path#/}"
+    dest="$OUTPUT_DIR/collected/$rel"
+    mkdir -p "$(dirname "$dest")"
+    if cp -p -- "$path" "$dest" 2>>"$LOG_FILE"; then
+        printf '%s\t%s\t%s\n' "$path" "$status" "collected/$rel" >> "$MANIFEST_FILE"
+        return 0
+    fi
+    printf '%s\tcopy_failed\t\n' "$path" >> "$MANIFEST_FILE"
+    return 1
+}
 
 while IFS= read -r path; do
     [[ -z "$path" ]] && continue
     total=$((total + 1))
 
     if [[ -e "$path" ]]; then
-        rel="${path#/}"
-        dest="$OUTPUT_DIR/collected/$rel"
-        mkdir -p "$(dirname "$dest")"
-        if cp -p -- "$path" "$dest" 2>>"$LOG_FILE"; then
+        if copy_file "$path" collected; then
             collected=$((collected + 1))
-            printf '%s\tcollected\t%s\n' "$path" "collected/$rel" >> "$MANIFEST_FILE"
         else
             failed=$((failed + 1))
-            printf '%s\tcopy_failed\t\n' "$path" >> "$MANIFEST_FILE"
         fi
     else
         missing=$((missing + 1))
@@ -70,10 +95,30 @@ done <<'__DATACHECK_PATH_LIST__'
 __PATH_LIST__
 __DATACHECK_PATH_LIST__
 
+for dir in __COVERAGE_DIRS__; do
+    [[ -d "$dir" ]] || continue
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+        [[ -e "$OUTPUT_DIR/collected/${path#/}" ]] && continue
+        if is_sensitive "$path"; then
+            skipped=$((skipped + 1))
+            printf '%s\tskipped_sensitive\t\n' "$path" >> "$MANIFEST_FILE"
+            continue
+        fi
+        if copy_file "$path" collected_dir; then
+            swept=$((swept + 1))
+        else
+            failed=$((failed + 1))
+        fi
+    done < <(find "$dir" -type f 2>>"$LOG_FILE" | sort)
+done
+
 {
-    echo "Total paths (deduped): $total"
-    echo "Collected            : $collected"
+    echo "Listed paths         : $total"
+    echo "Collected (listed)   : $collected"
     echo "Not found            : $missing"
+    echo "Collected (dir sweep): $swept"
+    echo "Skipped (sensitive)  : $skipped"
     echo "Copy failed          : $failed"
     echo "Output dir           : $OUTPUT_DIR"
 } | tee -a "$LOG_FILE"
@@ -119,6 +164,7 @@ def generate_script(extracted: dict[str, list[dict]], source_label: str, script_
     script = script.replace("__GENERATED_AT__", datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"))
     script = script.replace("__ENTRY_COUNT__", str(len(paths)))
     script = script.replace("__SCRIPT_NAME__", script_name)
+    script = script.replace("__COVERAGE_DIRS__", " ".join(COVERAGE_DIRS))
     script = script.replace("__PATH_LIST__", "\n".join(paths))
     return script
 
