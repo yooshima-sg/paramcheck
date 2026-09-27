@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+#
+sheets/
+settingarchives/
+
+# RHEL調査用に取得した参考パッケージのRPM本体(バイナリ、再取得可能なため非追跡)。
+# 展開後の設定ファイル(reference/rhel-pkgs/*/configs/)はテキストなので追跡対象のまま。
+reference/rhel-pkgs/*/rpms/
+
+# ツールの生成物。実データ由来の設定パス・設定値を含むため非追跡。
+collect_*.sh
+report.yaml
+report.tsv
+report.txt
